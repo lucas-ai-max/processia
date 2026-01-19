@@ -454,78 +454,143 @@ with tab1:
                             
                             safe_update_logs(log_display, st.session_state.logs)
                             
-                            def save_chunks_batch(chunks_batch):
-                                chunks_count[0] += len(chunks_batch)
-                                add_log(f"{filename}: {chunks_count[0]} chunks processados")
-                                components["vectorstore"].store_chunks(chunks_batch)
+                            # Verificar se já tem chunks e análise antes de processar
+                            existing_file_data = components["file_manager"].get_by_filename(filename)
+                            doc = None
+                            total_pages = 0
                             
-                            add_log(f"{filename}: Extraindo texto...")
-                            safe_update_progress(progress_bar, 0.1)
-                            
-                            doc = components["processor"].process_incremental(
-                                tmp_path,
-                                filename=filename,
-                                chunk_callback=save_chunks_batch,
-                                batch_size=50
-                            )
-                            
-                            total_pages = doc.get('metadata', {}).get('total_pages', 0)
-                            add_log(f"{filename}: {total_pages} páginas, {chunks_count[0]} chunks")
-                            
-                            # Análise automática
-                            if chunks_count[0] > 0:
-                                add_log(f"{filename}: Iniciando análise RAG...")
-                                safe_update_progress(progress_bar, 0.7)
+                            # Verificar se já tem chunks no banco
+                            if existing_file_data and existing_file_data.get("document_id") and existing_file_data.get("total_chunks", 0) > 0:
+                                document_id_existing = existing_file_data["document_id"]
                                 
-                                try:
-                                    add_log(f"{filename}: Chamando GPT-4.1 para análise...")
+                                # Verificar se chunks realmente existem no banco
+                                if components["vectorstore"].has_chunks(document_id=document_id_existing):
+                                    add_log(f"{filename}: Chunks já existem no banco")
+                                    chunks_count[0] = existing_file_data.get("total_chunks", 0)
+                                    total_pages = existing_file_data.get("total_pages", 0)
                                     
-                                    analise_result, resposta_bruta = components["analyzer"].analyze_full_document_rag(
-                                        doc["document_id"],
-                                        filename,
-                                        return_raw_response=True
-                                    )
+                                    # VERIFICAR SE ANÁLISE JÁ EXISTE
+                                    analysis_exists = components["storage"].has_analysis_by_filename(filename)
+                                    if analysis_exists:
+                                        add_log(f"{filename}: Chunks e análise já existem, nada a fazer")
+                                        # Atualizar status para CONCLUIDO se necessário
+                                        try:
+                                            if existing_file_data.get("status") != "CONCLUIDO":
+                                                components["file_manager"].update_status(
+                                                    filename,
+                                                    "CONCLUIDO",
+                                                    document_id=document_id_existing,
+                                                    total_chunks=chunks_count[0],
+                                                    total_pages=total_pages,
+                                                    existing_data=existing_file_data
+                                                )
+                                                add_log(f"{filename}: Status atualizado para CONCLUIDO")
+                                        except:
+                                            pass
+                                        safe_update_progress(progress_bar, 1.0)
+                                        safe_streamlit_call(st.info, f"ℹ️ **{filename}** já está totalmente processado!")
+                                        # Marcar para não processar
+                                        doc = None
+                                        chunks_count[0] = 0
+                                    else:
+                                        add_log(f"{filename}: Chunks existem mas análise não existe, rodando apenas análise...")
+                                        # Criar objeto doc simulado com o document_id existente para análise
+                                        doc = {
+                                            "document_id": document_id_existing,
+                                            "filename": filename,
+                                            "metadata": {
+                                                "total_pages": total_pages
+                                            }
+                                        }
+                                        add_log(f"{filename}: Reutilizando {chunks_count[0]} chunks existentes")
+                            
+                            # Se não tem chunks, processar PDF (mas não se já está totalmente processado)
+                            if doc is None and not (chunks_count[0] == 0 and existing_file_data and existing_file_data.get("document_id") and components["vectorstore"].has_chunks(document_id=existing_file_data["document_id"]) and components["storage"].has_analysis_by_filename(filename)):
+                                chunks_count = [0]
+                                
+                                def save_chunks_batch(chunks_batch):
+                                    chunks_count[0] += len(chunks_batch)
+                                    add_log(f"{filename}: {chunks_count[0]} chunks processados")
+                                    components["vectorstore"].store_chunks(chunks_batch)
+                                
+                                add_log(f"{filename}: Extraindo texto...")
+                                safe_update_progress(progress_bar, 0.1)
+                                
+                                doc = components["processor"].process_incremental(
+                                    tmp_path,
+                                    filename=filename,
+                                    chunk_callback=save_chunks_batch,
+                                    batch_size=50
+                                )
+                                
+                                total_pages = doc.get('metadata', {}).get('total_pages', 0)
+                                add_log(f"{filename}: {total_pages} páginas, {chunks_count[0]} chunks")
+                            
+                            # Análise automática (pular se já está totalmente processado)
+                            already_complete = (chunks_count[0] == 0 and existing_file_data and 
+                                              existing_file_data.get("document_id") and 
+                                              components["vectorstore"].has_chunks(document_id=existing_file_data["document_id"]) and 
+                                              components["storage"].has_analysis_by_filename(filename))
+                            
+                            if not already_complete and (chunks_count[0] > 0 or (doc is not None and doc.get("document_id"))):
+                                # Se doc existe mas chunks_count é 0, significa que chunks já existem e vamos só analisar
+                                if doc and chunks_count[0] == 0:
+                                    chunks_count[0] = existing_file_data.get("total_chunks", 0)
+                                    add_log(f"{filename}: Rodando apenas análise (chunks já existem)...")
+                                
+                                if chunks_count[0] > 0:
+                                    add_log(f"{filename}: Iniciando análise RAG...")
+                                    safe_update_progress(progress_bar, 0.7)
                                     
-                                    add_log(f"{filename}: Análise GPT-4.1 concluída. Resposta: {len(resposta_bruta)} chars")
-                                    
-                                    # Mostrar resposta da IA
-                                    safe_streamlit_call(st.markdown, f"#### 🤖 Resposta da IA - {filename}")
                                     try:
-                                        with st.expander("📄 Ver resposta completa", expanded=False):
-                                            safe_streamlit_call(st.markdown, resposta_bruta)
-                                    except Exception:
-                                        pass
+                                        add_log(f"{filename}: Chamando GPT-4.1 para análise...")
+                                        
+                                        analise_result, resposta_bruta = components["analyzer"].analyze_full_document_rag(
+                                            doc["document_id"],
+                                            filename,
+                                            return_raw_response=True
+                                        )
+                                        
+                                        add_log(f"{filename}: Análise GPT-4.1 concluída. Resposta: {len(resposta_bruta)} chars")
+                                        
+                                        # Mostrar resposta da IA
+                                        safe_streamlit_call(st.markdown, f"#### 🤖 Resposta da IA - {filename}")
+                                        try:
+                                            with st.expander("📄 Ver resposta completa", expanded=False):
+                                                safe_streamlit_call(st.markdown, resposta_bruta)
+                                        except Exception:
+                                            pass
+                                        
+                                        safe_update_progress(progress_bar, 0.9)
+                                        add_log(f"{filename}: Salvando no banco...")
+                                        
+                                        # Salvar análise
+                                        try:
+                                            components["storage"].save_analysis(**analise_result)
+                                            add_log(f"{filename}: Análise salva com sucesso")
+                                        except Exception as save_error:
+                                            add_log(f"{filename}: ERRO ao salvar - {str(save_error)}", "ERROR")
+                                            raise
+                                        
+                                        # Atualizar status para CONCLUIDO
+                                        components["file_manager"].update_status(
+                                            filename,
+                                            "CONCLUIDO",
+                                            document_id=doc["document_id"],
+                                            total_chunks=chunks_count[0],
+                                            total_pages=total_pages
+                                        )
+                                        add_log(f"{filename}: Status CONCLUIDO atualizado")
+                                        
+                                        safe_update_progress(progress_bar, 1.0)
+                                        add_log(f"✅ {filename} concluído!")
+                                        
+                                        safe_streamlit_call(st.success, f"✅ **{filename}** concluído! ({chunks_count[0]} chunks)")
+                                        safe_streamlit_call(st.balloons)
                                     
-                                    safe_update_progress(progress_bar, 0.9)
-                                    add_log(f"{filename}: Salvando no banco...")
-                                    
-                                    # Salvar análise
-                                    try:
-                                        components["storage"].save_analysis(**analise_result)
-                                        add_log(f"{filename}: Análise salva com sucesso")
-                                    except Exception as save_error:
-                                        add_log(f"{filename}: ERRO ao salvar - {str(save_error)}", "ERROR")
-                                        raise
-                                    
-                                    # Atualizar status para CONCLUIDO
-                                    components["file_manager"].update_status(
-                                        filename,
-                                        "CONCLUIDO",
-                                        document_id=doc["document_id"],
-                                        total_chunks=chunks_count[0],
-                                        total_pages=total_pages
-                                    )
-                                    add_log(f"{filename}: Status CONCLUIDO atualizado")
-                                    
-                                    safe_update_progress(progress_bar, 1.0)
-                                    add_log(f"✅ {filename} concluído!")
-                                    
-                                    safe_streamlit_call(st.success, f"✅ **{filename}** concluído! ({chunks_count[0]} chunks)")
-                                    safe_streamlit_call(st.balloons)
-                                    
-                                except Exception as e:
-                                    error_msg = str(e)
-                                    add_log(f"{filename}: ERRO na análise - {error_msg}", "ERROR")
+                                    except Exception as e:
+                                        error_msg = str(e)
+                                        add_log(f"{filename}: ERRO na análise - {error_msg}", "ERROR")
                                     components["file_manager"].update_status(
                                         filename,
                                         "ERRO",
@@ -754,19 +819,28 @@ with tab1:
                                 
                                 # Verificar se chunks realmente existem no banco
                                 if components["vectorstore"].has_chunks(document_id=document_id_existing):
-                                    add_log(f"[{idx+1}/{total_docs}] {filename}: Chunks já existem no banco, reutilizando...")
+                                    add_log(f"[{idx+1}/{total_docs}] {filename}: Chunks já existem no banco")
                                     chunks_count[0] = existing_file_data.get("total_chunks", 0)
                                     total_pages = existing_file_data.get("total_pages", 0)
                                     
-                                    # Criar objeto doc simulado com o document_id existente
-                                    doc = {
-                                        "document_id": document_id_existing,
-                                        "filename": filename,
-                                        "metadata": {
-                                            "total_pages": total_pages
+                                    # VERIFICAR SE ANÁLISE JÁ EXISTE
+                                    analysis_exists = components["storage"].has_analysis_by_filename(filename)
+                                    if analysis_exists:
+                                        add_log(f"[{idx+1}/{total_docs}] {filename}: Análise já existe, pulando processamento completo")
+                                        # Pular processamento completo (chunks e análise já existem)
+                                        doc = None
+                                        chunks_count[0] = 0  # Não processar nada
+                                    else:
+                                        add_log(f"[{idx+1}/{total_docs}] {filename}: Chunks existem mas análise não existe, rodando apenas análise...")
+                                        # Criar objeto doc simulado com o document_id existente para análise
+                                        doc = {
+                                            "document_id": document_id_existing,
+                                            "filename": filename,
+                                            "metadata": {
+                                                "total_pages": total_pages
+                                            }
                                         }
-                                    }
-                                    add_log(f"[{idx+1}/{total_docs}] {filename}: Reutilizando {chunks_count[0]} chunks existentes")
+                                        add_log(f"[{idx+1}/{total_docs}] {filename}: Reutilizando {chunks_count[0]} chunks existentes")
                                 else:
                                     # Document_id salvo mas chunks não existem mais, reprocessar
                                     add_log(f"[{idx+1}/{total_docs}] {filename}: Document ID encontrado mas chunks não existem, reprocessando...")
@@ -799,12 +873,47 @@ with tab1:
                                     add_log(f"[{idx+1}/{total_docs}] {filename}: ERRO no processamento - {str(proc_error)}", "ERROR")
                                     raise
                             
-                            # Continuar com análise se tiver chunks
+                            # Continuar com análise se tiver chunks OU se chunks já existem mas análise não
                             try:
+                                # Verificar se deve pular (chunks e análise já existem)
+                                if doc is None and chunks_count[0] == 0:
+                                    # Verificar se realmente tem chunks e análise
+                                    if existing_file_data and existing_file_data.get("document_id"):
+                                        document_id_existing = existing_file_data["document_id"]
+                                        if components["vectorstore"].has_chunks(document_id=document_id_existing):
+                                            analysis_exists = components["storage"].has_analysis_by_filename(filename)
+                                            if analysis_exists:
+                                                # Pular completamente
+                                                add_log(f"[{idx+1}/{total_docs}] {filename}: Já totalmente processado, pulando...")
+                                                # Atualizar status para CONCLUIDO se necessário
+                                                try:
+                                                    current_status = components["file_manager"].get_by_filename(filename)
+                                                    if current_status and current_status.get("status") != "CONCLUIDO":
+                                                        components["file_manager"].update_status(
+                                                            filename,
+                                                            "CONCLUIDO",
+                                                            document_id=document_id_existing,
+                                                            total_chunks=existing_file_data.get("total_chunks", 0),
+                                                            total_pages=existing_file_data.get("total_pages", 0),
+                                                            existing_data=current_status
+                                                        )
+                                                        add_log(f"[{idx+1}/{total_docs}] {filename}: Status atualizado para CONCLUIDO")
+                                                except:
+                                                    pass
+                                                safe_update_progress(progress_bar, (idx + 1) / total_docs)
+                                                continue  # Pular para próximo documento
+                                
                                 # Análise automática
-                                if chunks_count[0] > 0:
-                                    add_log(f"[{idx+1}/{total_docs}] {filename}: Iniciando análise RAG...")
-                                    safe_update_progress(progress_bar, (idx + 0.7) / total_docs)
+                                # Se chunks_count[0] > 0 OU se doc existe (chunks já existem), fazer análise
+                                if chunks_count[0] > 0 or (doc is not None and doc.get("document_id")):
+                                    # Se doc existe mas chunks_count é 0, significa que chunks já existem e vamos só analisar
+                                    if doc and chunks_count[0] == 0:
+                                        chunks_count[0] = existing_file_data.get("total_chunks", 0)
+                                        add_log(f"[{idx+1}/{total_docs}] {filename}: Rodando apenas análise (chunks já existem)...")
+                                    
+                                    if chunks_count[0] > 0:
+                                        add_log(f"[{idx+1}/{total_docs}] {filename}: Iniciando análise RAG...")
+                                        safe_update_progress(progress_bar, (idx + 0.7) / total_docs)
                                     
                                     try:
                                         add_log(f"[{idx+1}/{total_docs}] {filename}: Chamando GPT-4.1 para análise...")

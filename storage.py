@@ -137,6 +137,19 @@ class ResponseStorage:
         
         return result.data if result.data else []
     
+    def has_analysis_by_filename(self, filename: str) -> bool:
+        """Verifica se existe análise para um arquivo"""
+        try:
+            result = self.supabase.table(settings.TABLE_RESPOSTAS)\
+                .select("id")\
+                .eq("arquivo_original", filename)\
+                .limit(1)\
+                .execute()
+            
+            return len(result.data) > 0 if result.data else False
+        except Exception:
+            return False
+    
     def get_all(self, status: Optional[str] = None) -> List[Dict]:
         """Recupera todas análises
         
