@@ -93,98 +93,33 @@ def _custom_excepthook(exc_type, exc_value, exc_traceback):
         except:
             pass
 
-# Aplicar o excepthook customizado apenas se não estiver em modo de desenvolvimento rigoroso
-# IMPORTANTE: Desabilitar temporariamente para evitar problemas de renderização
-# O filtro de logging já é suficiente para suprimir os erros do Tornado
-# if not os.environ.get("DEBUG_STREAMLIT"):
-#     sys.excepthook = _custom_excepthook
+# Aplicar o excepthook customizado de forma segura
+if not os.environ.get("DEBUG_STREAMLIT"):
+    sys.excepthook = _custom_excepthook
 
-# Redirecionar stderr para filtrar mensagens do Tornado antes de exibir
-_original_stderr = sys.stderr
+# Filtro de stderr específico para mensagens do Tornado (mais seguro)
+_original_stderr_write = sys.stderr.write
 
-class FilteredStderr:
-    """Wrapper para stderr que filtra mensagens do Tornado"""
-    def __init__(self, original_stderr):
-        self.original_stderr = original_stderr
-        self.buffer = ""
-        self.max_buffer_size = 10000  # Limitar tamanho do buffer
-    
-    def write(self, text):
-        """Escreve apenas se não for mensagem do Tornado"""
-        if not text:
-            return
-            
-        # Acumular texto no buffer
-        self.buffer += text
-        
-        # Se o buffer ficar muito grande, limpar e escrever tudo
-        if len(self.buffer) > self.max_buffer_size:
-            accumulated = self.buffer
-            self.buffer = ""
-            if not self._should_filter(accumulated):
-                self.original_stderr.write(accumulated)
-            return
-        
-        # Se o texto termina com nova linha ou é um traceback completo, verificar
-        if text.endswith('\n') or 'traceback' in self.buffer.lower():
-            # Verificar se deve filtrar o buffer acumulado
-            if self._should_filter(self.buffer):
-                self.buffer = ""
-                return
-            else:
-                # Escrever buffer e limpar
-                accumulated = self.buffer
-                self.buffer = ""
-                self.original_stderr.write(accumulated)
-    
-    def _should_filter(self, text):
-        """Verifica se o texto deve ser filtrado"""
-        if not text:
-            return False
-            
+def _filtered_stderr_write(text):
+    """Filtra apenas mensagens específicas do Tornado WebSocket"""
+    if text:
         text_lower = text.lower()
-        
-        # Palavras-chave que indicam erros do Tornado
-        tornado_keywords = [
+        # Filtrar apenas mensagens específicas do Tornado
+        tornado_errors = [
             'websocketclosederror',
-            'streamclosederror', 
-            'stream is closed',
+            'streamclosederror',
             'task exception was never retrieved',
-            'tornado.websocket',
-            'tornado.iostream',
-            'raise websocketclosederror',
         ]
-        
-        # Verificar se contém keywords do Tornado
-        has_tornado_keywords = any(keyword in text_lower for keyword in tornado_keywords)
-        has_tornado_module = 'tornado' in text_lower and ('file "' in text_lower or 'traceback' in text_lower)
-        
-        # Filtrar se for claramente um erro do Tornado
-        if has_tornado_keywords or has_tornado_module:
-            # Verificar se é realmente relacionado a WebSocket fechado
-            if any(err in text_lower for err in ['websocketclosederror', 'streamclosederror', 'stream is closed']):
-                return True
-            # Verificar se é "task exception was never retrieved" relacionado ao Tornado
-            if 'task exception was never retrieved' in text_lower and 'tornado' in text_lower:
-                return True
-        
-        return False
-    
-    def flush(self):
-        if self.buffer:
-            if not self._should_filter(self.buffer):
-                self.original_stderr.write(self.buffer)
-            self.buffer = ""
-        self.original_stderr.flush()
-    
-    def __getattr__(self, name):
-        return getattr(self.original_stderr, name)
+        # Verificar se contém erros do Tornado E se é realmente do módulo tornado
+        if any(err in text_lower for err in tornado_errors):
+            # Verificar se é do módulo tornado (evitar falsos positivos)
+            if 'tornado' in text_lower or ('file "' in text_lower and 'tornado' in text_lower):
+                return  # Não escrever
+    _original_stderr_write(text)
 
-# Aplicar filtro apenas se não estiver em modo debug
-# IMPORTANTE: Não aplicar o filtro de stderr pois pode interferir com o Streamlit
-# O filtro de logging e excepthook já são suficientes
-# if not os.environ.get("DEBUG_STREAMLIT"):
-#     sys.stderr = FilteredStderr(_original_stderr)
+# Aplicar filtro de stderr apenas se não estiver em modo debug
+if not os.environ.get("DEBUG_STREAMLIT"):
+    sys.stderr.write = _filtered_stderr_write
 
 # Configurar asyncio para não mostrar warnings de exceções não tratadas em tasks
 try:
@@ -222,22 +157,44 @@ try:
             # Se houver erro no handler, simplesmente ignorar
             pass
     
-    # Tentar configurar o exception handler quando o loop for criado
-    # Usar um hook para quando o Streamlit criar o loop
-    def _setup_asyncio_handler():
-        try:
-            loop = asyncio.get_running_loop()
-            if loop and not loop.is_closed():
-                loop.set_exception_handler(_custom_exception_handler)
-        except RuntimeError:
-            # Sem loop rodando ainda, tentar novamente depois
-            pass
+    # Configurar o handler quando o Streamlit inicializar
+    # Usar threading para configurar após o Streamlit criar o loop
+    import threading
+    import time
     
-    # Tentar configurar imediatamente se houver loop
-    try:
-        _setup_asyncio_handler()
-    except:
-        pass
+    def setup_asyncio_handler_delayed():
+        """Configura o handler do asyncio após um delay para garantir que o loop existe"""
+        time.sleep(1)  # Aguardar Streamlit inicializar
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                # Tentar obter o loop atual
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    # Se não houver loop rodando, tentar obter o loop do evento
+                    try:
+                        loop = asyncio.get_event_loop()
+                    except RuntimeError:
+                        # Aguardar mais um pouco e tentar novamente
+                        if attempt < max_attempts - 1:
+                            time.sleep(0.5)
+                            continue
+                        return
+                
+                if loop and not loop.is_closed():
+                    loop.set_exception_handler(_custom_exception_handler)
+                    return  # Sucesso
+            except Exception:
+                if attempt < max_attempts - 1:
+                    time.sleep(0.5)
+                    continue
+                return
+    
+    # Iniciar thread para configurar o handler (não bloquear a inicialização)
+    if not os.environ.get("DEBUG_STREAMLIT"):
+        thread = threading.Thread(target=setup_asyncio_handler_delayed, daemon=True)
+        thread.start()
         
 except ImportError:
     pass
