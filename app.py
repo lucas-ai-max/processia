@@ -23,7 +23,8 @@ tornado_loggers = [
     "tornado.websocket",
     "tornado.iostream",
     "tornado.curl_httpclient",
-    "tornado.httpclient"
+    "tornado.httpclient",
+    "tornado",
 ]
 
 for logger_name in tornado_loggers:
@@ -31,9 +32,31 @@ for logger_name in tornado_loggers:
     logger.setLevel(logging.CRITICAL)
     # Adicionar handler que descarta todas as mensagens
     logger.propagate = False
-    if not logger.handlers:
-        null_handler = logging.NullHandler()
-        logger.addHandler(null_handler)
+    # Remover handlers existentes e adicionar NullHandler
+    logger.handlers = []
+    null_handler = logging.NullHandler()
+    logger.addHandler(null_handler)
+
+# Suprimir também os handlers de root logger que possam estar propagando mensagens do Tornado
+root_logger = logging.getLogger()
+for handler in root_logger.handlers[:]:
+    # Não remover, mas configurar para filtrar mensagens do Tornado
+    if hasattr(handler, 'addFilter'):
+        class TornadoFilter(logging.Filter):
+            def filter(self, record):
+                # Filtrar mensagens relacionadas ao Tornado
+                if hasattr(record, 'name') and record.name and 'tornado' in record.name.lower():
+                    return False
+                if hasattr(record, 'pathname') and record.pathname and 'tornado' in record.pathname.lower():
+                    return False
+                if hasattr(record, 'module') and record.module and 'tornado' in record.module.lower():
+                    return False
+                # Filtrar mensagens específicas
+                msg = str(record.msg).lower() if record.msg else ''
+                if any(keyword in msg for keyword in ['websocketclosederror', 'streamclosederror', 'task exception was never retrieved']):
+                    return False
+                return True
+        handler.addFilter(TornadoFilter())
 
 # Suprimir warnings de WebSocket fechado
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*WebSocket.*")
@@ -71,8 +94,97 @@ def _custom_excepthook(exc_type, exc_value, exc_traceback):
             pass
 
 # Aplicar o excepthook customizado apenas se não estiver em modo de desenvolvimento rigoroso
-if not os.environ.get("DEBUG_STREAMLIT"):
-    sys.excepthook = _custom_excepthook
+# IMPORTANTE: Desabilitar temporariamente para evitar problemas de renderização
+# O filtro de logging já é suficiente para suprimir os erros do Tornado
+# if not os.environ.get("DEBUG_STREAMLIT"):
+#     sys.excepthook = _custom_excepthook
+
+# Redirecionar stderr para filtrar mensagens do Tornado antes de exibir
+_original_stderr = sys.stderr
+
+class FilteredStderr:
+    """Wrapper para stderr que filtra mensagens do Tornado"""
+    def __init__(self, original_stderr):
+        self.original_stderr = original_stderr
+        self.buffer = ""
+        self.max_buffer_size = 10000  # Limitar tamanho do buffer
+    
+    def write(self, text):
+        """Escreve apenas se não for mensagem do Tornado"""
+        if not text:
+            return
+            
+        # Acumular texto no buffer
+        self.buffer += text
+        
+        # Se o buffer ficar muito grande, limpar e escrever tudo
+        if len(self.buffer) > self.max_buffer_size:
+            accumulated = self.buffer
+            self.buffer = ""
+            if not self._should_filter(accumulated):
+                self.original_stderr.write(accumulated)
+            return
+        
+        # Se o texto termina com nova linha ou é um traceback completo, verificar
+        if text.endswith('\n') or 'traceback' in self.buffer.lower():
+            # Verificar se deve filtrar o buffer acumulado
+            if self._should_filter(self.buffer):
+                self.buffer = ""
+                return
+            else:
+                # Escrever buffer e limpar
+                accumulated = self.buffer
+                self.buffer = ""
+                self.original_stderr.write(accumulated)
+    
+    def _should_filter(self, text):
+        """Verifica se o texto deve ser filtrado"""
+        if not text:
+            return False
+            
+        text_lower = text.lower()
+        
+        # Palavras-chave que indicam erros do Tornado
+        tornado_keywords = [
+            'websocketclosederror',
+            'streamclosederror', 
+            'stream is closed',
+            'task exception was never retrieved',
+            'tornado.websocket',
+            'tornado.iostream',
+            'raise websocketclosederror',
+        ]
+        
+        # Verificar se contém keywords do Tornado
+        has_tornado_keywords = any(keyword in text_lower for keyword in tornado_keywords)
+        has_tornado_module = 'tornado' in text_lower and ('file "' in text_lower or 'traceback' in text_lower)
+        
+        # Filtrar se for claramente um erro do Tornado
+        if has_tornado_keywords or has_tornado_module:
+            # Verificar se é realmente relacionado a WebSocket fechado
+            if any(err in text_lower for err in ['websocketclosederror', 'streamclosederror', 'stream is closed']):
+                return True
+            # Verificar se é "task exception was never retrieved" relacionado ao Tornado
+            if 'task exception was never retrieved' in text_lower and 'tornado' in text_lower:
+                return True
+        
+        return False
+    
+    def flush(self):
+        if self.buffer:
+            if not self._should_filter(self.buffer):
+                self.original_stderr.write(self.buffer)
+            self.buffer = ""
+        self.original_stderr.flush()
+    
+    def __getattr__(self, name):
+        return getattr(self.original_stderr, name)
+
+# Aplicar filtro apenas se não estiver em modo debug
+# IMPORTANTE: Não aplicar o filtro de stderr pois pode interferir com o Streamlit
+# O filtro de logging e excepthook já são suficientes
+# if not os.environ.get("DEBUG_STREAMLIT"):
+#     sys.stderr = FilteredStderr(_original_stderr)
 
 # Configurar asyncio para não mostrar warnings de exceções não tratadas em tasks
 try:
@@ -110,11 +222,22 @@ try:
             # Se houver erro no handler, simplesmente ignorar
             pass
     
-    # Tentar configurar o exception handler se possível
-    # Nota: Não configuramos aqui porque o loop do asyncio é criado pelo Streamlit
-    # O Streamlit já tem seu próprio loop, então não precisamos criar um aqui
-    # O handler será útil se for chamado pelo Streamlit/Tornado
-    pass
+    # Tentar configurar o exception handler quando o loop for criado
+    # Usar um hook para quando o Streamlit criar o loop
+    def _setup_asyncio_handler():
+        try:
+            loop = asyncio.get_running_loop()
+            if loop and not loop.is_closed():
+                loop.set_exception_handler(_custom_exception_handler)
+        except RuntimeError:
+            # Sem loop rodando ainda, tentar novamente depois
+            pass
+    
+    # Tentar configurar imediatamente se houver loop
+    try:
+        _setup_asyncio_handler()
+    except:
+        pass
         
 except ImportError:
     pass
@@ -283,9 +406,17 @@ def safe_streamlit_call(func, *args, **kwargs):
         pass
 
 def safe_rerun():
-    """Chama st.rerun() de forma segura"""
+    """Chama st.rerun() de forma segura com fallback para versões antigas"""
     try:
-        st.rerun()
+        # Tentar usar st.rerun() (Streamlit >= 1.18.0)
+        if hasattr(st, 'rerun'):
+            st.rerun()
+        # Fallback para versões antigas
+        elif hasattr(st, 'experimental_rerun'):
+            st.experimental_rerun()
+        else:
+            # Se nenhum método estiver disponível, não fazer nada
+            pass
     except (Exception, RuntimeError, AttributeError, TypeError):
         # Ignorar erros de WebSocket fechado ao fazer rerun
         pass
@@ -884,7 +1015,7 @@ with tab1:
                         safe_streamlit_call(st.balloons)
                         safe_streamlit_call(st.success, "🎉 Processamento em lote concluído!")
                     
-                    st.rerun()
+                    safe_rerun()
         else:
             st.warning("⚠️ Nenhum arquivo PDF encontrado na pasta especificada")
     elif folder_path:

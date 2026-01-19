@@ -352,13 +352,31 @@ class VectorStore:
     def enforce_document_limit(self, new_document_id: str):
         """Remove 3 documentos mais antigos para cada novo documento adicionado"""
         try:
-            # Verificar se o novo documento já existe (pode estar sendo reprocessado)
-            new_doc_exists = self.has_chunks(document_id=new_document_id)
+            # Cache para evitar processar o mesmo documento múltiplas vezes
+            if not hasattr(self, '_processed_docs'):
+                self._processed_docs = set()
             
-            # Se o documento já existe, não precisamos remover nada (será atualizado)
-            if new_doc_exists:
-                print(f"Documento {new_document_id} já existe, não será necessário remover documentos antigos")
+            # Se já processamos este documento nesta execução, pular
+            if new_document_id in self._processed_docs:
                 return
+            
+            # Verificar se o novo documento já existe no banco (com chunks significativos)
+            try:
+                result = self.supabase.table(settings.TABLE_EMBEDDINGS)\
+                    .select("id", count="exact")\
+                    .eq("document_id", new_document_id)\
+                    .execute()
+                
+                chunk_count = result.count if hasattr(result, 'count') else len(result.data)
+                
+                # Se já tem chunks significativos (mais de 10), considerar que já existe
+                if chunk_count > 10:
+                    print(f"Documento {new_document_id} já existe ({chunk_count} chunks), não será necessário remover documentos antigos")
+                    self._processed_docs.add(new_document_id)
+                    return
+            except Exception as e:
+                # Se houver erro, continuar normalmente
+                pass
             
             # Remover 3 documentos mais antigos para cada novo documento
             documents_to_remove = 3
@@ -390,6 +408,9 @@ class VectorStore:
                 print(f"✅ Removidos {removed} documento(s) antigo(s) antes de adicionar o novo documento")
             else:
                 print(f"ℹ️ Nenhum documento antigo foi removido (tabela pode estar vazia ou só contém o documento atual)")
+            
+            # Marcar este documento como processado
+            self._processed_docs.add(new_document_id)
                     
         except Exception as e:
             print(f"Erro ao aplicar limite de documentos: {e}")
