@@ -12,16 +12,112 @@ import pandas as pd
 import json
 import logging
 import warnings
+import sys
 
 # Configurar logging para filtrar erros de WebSocket do Tornado
-logging.getLogger("tornado.access").setLevel(logging.ERROR)
-logging.getLogger("tornado.application").setLevel(logging.ERROR)
-logging.getLogger("tornado.general").setLevel(logging.ERROR)
-logging.getLogger("tornado.websocket").setLevel(logging.ERROR)
+# Definir nível CRITICAL para suprimir completamente os logs do Tornado
+tornado_loggers = [
+    "tornado.access",
+    "tornado.application", 
+    "tornado.general",
+    "tornado.websocket",
+    "tornado.iostream",
+    "tornado.curl_httpclient",
+    "tornado.httpclient"
+]
+
+for logger_name in tornado_loggers:
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.CRITICAL)
+    # Adicionar handler que descarta todas as mensagens
+    logger.propagate = False
+    if not logger.handlers:
+        null_handler = logging.NullHandler()
+        logger.addHandler(null_handler)
 
 # Suprimir warnings de WebSocket fechado
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*WebSocket.*")
 warnings.filterwarnings("ignore", message=".*Task exception was never retrieved.*")
+warnings.filterwarnings("ignore", message=".*StreamClosedError.*")
+warnings.filterwarnings("ignore", message=".*WebSocketClosedError.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="tornado.*")
+
+# Custom excepthook para filtrar erros de WebSocket do Tornado
+_original_excepthook = sys.excepthook
+
+def _custom_excepthook(exc_type, exc_value, exc_traceback):
+    """Filtra erros de WebSocket do Tornado que não são críticos"""
+    try:
+        # Verificar se é um erro relacionado ao Tornado
+        module_name = getattr(exc_type, '__module__', None) or ''
+        if "tornado" in module_name:
+            error_name = getattr(exc_type, '__name__', '')
+            # Ignorar erros de WebSocket e Stream fechados
+            if error_name in ("WebSocketClosedError", "StreamClosedError"):
+                return
+            # Ignorar se a mensagem contém referências a WebSocket/Stream fechados
+            if exc_value and isinstance(exc_value, Exception):
+                error_msg = str(exc_value).lower()
+                if any(keyword in error_msg for keyword in ["websocket", "stream closed", "stream is closed"]):
+                    return
+        
+        # Para outros erros, usar o handler original
+        _original_excepthook(exc_type, exc_value, exc_traceback)
+    except Exception:
+        # Se houver qualquer erro no handler customizado, usar o original como fallback
+        try:
+            _original_excepthook(exc_type, exc_value, exc_traceback)
+        except:
+            pass
+
+# Aplicar o excepthook customizado apenas se não estiver em modo de desenvolvimento rigoroso
+if not os.environ.get("DEBUG_STREAMLIT"):
+    sys.excepthook = _custom_excepthook
+
+# Configurar asyncio para não mostrar warnings de exceções não tratadas em tasks
+try:
+    import asyncio
+    
+    # Função customizada para lidar com exceções não tratadas em callbacks
+    def _custom_exception_handler(loop, context):
+        """Filtra exceções de WebSocket do Tornado em callbacks assíncronos"""
+        try:
+            exception = context.get('exception')
+            if exception:
+                # Verificar se é um erro relacionado ao Tornado WebSocket
+                exc_type = type(exception)
+                module_name = getattr(exc_type, '__module__', None) or ''
+                if "tornado" in module_name:
+                    error_name = getattr(exc_type, '__name__', '')
+                    if error_name in ("WebSocketClosedError", "StreamClosedError"):
+                        return  # Ignorar silenciosamente
+                
+                # Verificar mensagem de contexto
+                message = str(context.get('message', '')).lower()
+                if any(keyword in message for keyword in ["websocket", "stream closed"]):
+                    return  # Ignorar silenciosamente
+            
+            # Para outros erros, usar comportamento padrão (mas silenciar tasks do Tornado)
+            message_str = str(context.get('message', ''))
+            if 'Task exception was never retrieved' in message_str:
+                # Verificar se a exceção é relacionada ao Tornado
+                if exception:
+                    module_name = getattr(type(exception), '__module__', None) or ''
+                    if "tornado" in module_name:
+                        return  # Ignorar tasks do Tornado
+            # Não fazer nada - deixar comportamento padrão para outros erros
+        except Exception:
+            # Se houver erro no handler, simplesmente ignorar
+            pass
+    
+    # Tentar configurar o exception handler se possível
+    # Nota: Não configuramos aqui porque o loop do asyncio é criado pelo Streamlit
+    # O Streamlit já tem seu próprio loop, então não precisamos criar um aqui
+    # O handler será útil se for chamado pelo Streamlit/Tornado
+    pass
+        
+except ImportError:
+    pass
 
 # #region agent log
 def debug_log(location, message, data, hypothesis_id="A", session_id="debug-session", run_id="run1"):
