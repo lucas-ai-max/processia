@@ -15,6 +15,33 @@ class DocumentProcessor:
                 "Instale pypdf: pip install pypdf"
             )
     
+    def _fix_unicode_text(self, text: str) -> str:
+        """Converte códigos Unicode /uniXXXX para caracteres legíveis"""
+        if not text or '/uni' not in text:
+            return text
+        
+        # Padrão para encontrar /uniXXXX
+        pattern = r'/uni([0-9A-Fa-f]{4})'
+        
+        def replace_unicode(match):
+            try:
+                # Converter código hexadecimal para caractere
+                code = int(match.group(1), 16)
+                return chr(code)
+            except (ValueError, OverflowError):
+                # Se falhar, retornar o código original
+                return match.group(0)
+        
+        # Substituir todos os códigos Unicode
+        fixed_text = re.sub(pattern, replace_unicode, text)
+        
+        # Limpar apenas espaços horizontais múltiplos (preservar quebras de linha)
+        fixed_text = re.sub(r'[ \t]+', ' ', fixed_text)  # Apenas espaços e tabs, não \n
+        # Normalizar apenas múltiplas quebras de linha consecutivas (3+ vira 2)
+        fixed_text = re.sub(r'\n\n\n+', '\n\n', fixed_text)
+        
+        return fixed_text.strip()
+    
     def process(self, pdf_path: str, filename: str = None) -> Dict:
         """Extrai documento usando pypdf
         
@@ -36,8 +63,8 @@ class DocumentProcessor:
         for page_num, page in enumerate(reader.pages, 1):
             try:
                 content = page.extract_text()
-                # Limpar e decodificar códigos Unicode
-                content = self._clean_extracted_text(content)
+                # Corrigir códigos Unicode
+                content = self._fix_unicode_text(content)
             except Exception as e:
                 content = f"[Erro ao extrair texto da página {page_num}: {str(e)}]"
             
@@ -136,8 +163,9 @@ class DocumentProcessor:
         for page_num, page in enumerate(reader.pages, 1):
             try:
                 content = page.extract_text()
-                # Limpar e decodificar códigos Unicode
-                content = self._clean_extracted_text(content)
+                
+                # Corrigir códigos Unicode
+                content = self._fix_unicode_text(content)
                 
                 # Limitar tamanho de páginas muito grandes
                 if len(content) > MAX_PAGE_SIZE:
@@ -160,13 +188,55 @@ class DocumentProcessor:
             })
             
             # Criar chunks desta página
+            if not content or not content.strip():
+                continue  # Pular páginas vazias
+            
+            content = content.strip()
+            
+            if not content:  # Se após normalização ficou vazio, pular
+                continue
+            
+            # Verificar se este conteúdo não é duplicado da página anterior
+            if all_chunks:
+                last_chunk_content = all_chunks[-1].get("content", "")
+                # Se o conteúdo começar com os últimos 100 chars do chunk anterior, pode ser duplicata
+                if len(content) >= 100 and len(last_chunk_content) >= 100:
+                    last_100 = last_chunk_content[-100:]
+                    first_100 = content[:100]
+                    # Verificar sobreposição
+                    if first_100 == last_100:
+                        print(f"Aviso: Página {page_num} parece duplicar final da anterior. Removendo sobreposição...")
+                        # Tentar encontrar onde começa o conteúdo novo
+                        overlap_pos = last_chunk_content.rfind(content[:50])
+                        if overlap_pos > 0:
+                            # Pular a parte duplicada
+                            skip_chars = len(last_chunk_content) - overlap_pos
+                            if skip_chars < len(content):
+                                content = content[skip_chars:].strip()
+                            if not content or len(content) < 10:
+                                print(f"Aviso: Página {page_num} completamente duplicada, ignorando...")
+                                continue
+            
+            # Criar chunks desta página
             if len(content) > settings.CHUNK_SIZE:
                 page_chunks_texts = self._split_text(content, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)
             else:
                 page_chunks_texts = [content] if content.strip() else []
             
-            # Criar objetos chunk
+            # Criar objetos chunk, evitando duplicatas
+            seen_chunk_contents = set()
             for chunk_text in page_chunks_texts:
+                chunk_text = chunk_text.strip()
+                if not chunk_text:
+                    continue
+                
+                # Verificar se este chunk não é duplicata (mesmo conteúdo exato)
+                if chunk_text in seen_chunk_contents:
+                    print(f"Aviso: Chunk duplicado ignorado na página {page_num}")
+                    continue
+                
+                seen_chunk_contents.add(chunk_text)
+                
                 all_chunks.append({
                     "chunk_id": chunk_id,
                     "content": chunk_text,
@@ -233,6 +303,7 @@ class DocumentProcessor:
         
         chunks = []
         start = 0
+        min_chunk_size = max(100, chunk_size // 10)  # Mínimo de 100 caracteres ou 10% do chunk_size
         
         while start < len(text):
             end = min(start + chunk_size, len(text))
@@ -258,56 +329,48 @@ class DocumentProcessor:
             chunk = text[start:end]
             stripped = chunk.strip()
             
-            if stripped:  # Só adicionar se não estiver vazio
-                chunks.append(stripped)
+            # Só adicionar se tiver tamanho mínimo e não for muito similar ao chunk anterior
+            if stripped and len(stripped) >= min_chunk_size:
+                # Verificar se não é muito similar ao último chunk (evitar duplicatas)
+                if not chunks or not self._is_mostly_overlapping(stripped, chunks[-1]):
+                    chunks.append(stripped)
             
-            # Mover start considerando overlap
+            # Mover start (sem overlap se overlap = 0, ou com overlap se especificado)
             if end < len(text):
-                start = max(end - chunk_overlap, start + 1)
+                if chunk_overlap > 0:
+                    start = max(end - chunk_overlap, start + 1)
+                else:
+                    start = end  # Sem overlap - próximo chunk começa exatamente onde o anterior terminou
             else:
                 break
             
             # Prevenir loop infinito
-            if start >= len(text):
+            if start >= len(text) or start == end:
                 break
         
         return chunks
     
-    def _decode_unicode_codes(self, text: str) -> str:
-        """Decodifica códigos Unicode no formato /uniXXXX para caracteres reais
+    def _is_mostly_overlapping(self, text1: str, text2: str, threshold: float = 0.8) -> bool:
+        """Verifica se dois textos têm mais de threshold% de sobreposição"""
+        if not text1 or not text2:
+            return False
         
-        Exemplo: /uni0020 -> espaço, /uni0069 -> 'i'
-        """
-        if not text or '/uni' not in text:
-            return text
+        # Comparar sufixos/prefixos para detectar overlap significativo
+        min_len = min(len(text1), len(text2))
+        overlap_len = 0
         
-        def replace_unicode(match):
-            hex_code = match.group(1)
-            try:
-                # Converter hex para int e depois para char Unicode
-                unicode_value = int(hex_code, 16)
-                return chr(unicode_value)
-            except (ValueError, OverflowError):
-                # Se não conseguir decodificar, manter o código original
-                return match.group(0)
+        # Verificar se final de text1 está no início de text2
+        for i in range(min(200, min_len), 0, -1):  # Verificar até 200 caracteres
+            if text1[-i:] == text2[:i]:
+                overlap_len = i
+                break
         
-        # Padrão: /uni seguido de 4 dígitos hexadecimais
-        pattern = r'/uni([0-9A-Fa-f]{4})'
-        return re.sub(pattern, replace_unicode, text)
-    
-    def _clean_extracted_text(self, text: str) -> str:
-        """Limpa e normaliza texto extraído do PDF"""
-        if not text:
-            return text
+        # Se overlap é maior que threshold do menor texto, considerar duplicata
+        if overlap_len > 0:
+            overlap_ratio = overlap_len / min_len
+            return overlap_ratio >= threshold
         
-        # Primeiro, decodificar códigos Unicode
-        text = self._decode_unicode_codes(text)
-        
-        # Normalizar espaços em branco múltiplos
-        text = re.sub(r' +', ' ', text)
-        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
-        
-        return text
+        return False
     
     def _extract_numero_processo(self, text: str) -> str:
         """Extrai número do processo"""

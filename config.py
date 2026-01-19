@@ -11,9 +11,8 @@ class Settings(BaseSettings):
     
     # Performance
     CHUNK_SIZE: int = 2000
-    CHUNK_OVERLAP: int = 300
+    CHUNK_OVERLAP: int = 0  # Zero overlap para evitar repetição de conteúdo
     MAX_WORKERS: int = 4  # Paralelo
-    MAX_DOCUMENTS: int = 10  # Limite máximo de documentos na tabela (FIFO)
     
     # Tabelas
     TABLE_EMBEDDINGS: str = "documento_chunks"

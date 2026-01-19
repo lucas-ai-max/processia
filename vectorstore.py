@@ -40,7 +40,7 @@ class VectorStore:
         return cleaned.strip()
     
     def store_chunks(self, chunks: List[Dict]):
-        """Armazena chunks com embeddings em paralelo, evitando duplicações"""
+        """Armazena chunks com embeddings em paralelo"""
         
         # Limpar conteúdo de cada chunk e filtrar vazios
         cleaned_chunks = []
@@ -57,39 +57,13 @@ class VectorStore:
             print("Aviso: Nenhum chunk válido para processar")
             return
         
-        # Obter document_id do primeiro chunk (todos devem ter o mesmo)
-        new_document_id = cleaned_chunks[0]["document_id"]
-        
-        # Verificar quais chunks já existem para evitar duplicação
-        existing_chunk_ids = self.get_existing_chunk_ids(new_document_id)
-        
-        # Filtrar chunks que já existem
-        new_chunks = []
-        skipped_count = 0
-        for chunk in cleaned_chunks:
-            chunk_id = chunk["chunk_id"]
-            if chunk_id in existing_chunk_ids:
-                skipped_count += 1
-                continue
-            new_chunks.append(chunk)
-        
-        if skipped_count > 0:
-            print(f"Aviso: {skipped_count} chunk(s) já existem para document_id {new_document_id}, serão ignorados")
-        
-        if not new_chunks:
-            print(f"Todos os {len(cleaned_chunks)} chunks já existem para document_id {new_document_id}. Nada a inserir.")
-            return
-        
-        # Aplicar limite de documentos (remover os mais antigos se necessário)
-        self.enforce_document_limit(new_document_id)
-        
-        # Criar embeddings apenas para os novos chunks
-        texts = [chunk["content"] for chunk in new_chunks]
+        # Criar embeddings em batch (rápido)
+        texts = [chunk["content"] for chunk in cleaned_chunks]
         embeddings = self._create_embeddings_batch(texts)
         
-        # Preparar registros apenas para chunks novos
+        # Preparar registros
         records = []
-        for chunk, embedding in zip(new_chunks, embeddings):
+        for chunk, embedding in zip(cleaned_chunks, embeddings):
             # Só incluir se tiver embedding válido
             if embedding:
                 records.append({
@@ -103,7 +77,6 @@ class VectorStore:
         
         # Inserir em batch com delay antes para não sobrecarregar o banco
         if records:
-            print(f"Inserindo {len(records)} novo(s) chunk(s) para document_id {new_document_id}")
             # Pequeno delay antes de inserir para evitar sobrecarga
             time.sleep(0.5)
             self._insert_batch(records)
@@ -189,46 +162,7 @@ class VectorStore:
                         time.sleep(delay_between_batches)
                     break  # Sucesso, sair do loop de retry
                 except APIError as e:
-                    error_str = str(e).lower()
                     error_code = e.code if hasattr(e, 'code') else str(getattr(e, 'message', {}))
-                    
-                    # Verificar se é erro de duplicação (unique constraint violation)
-                    # Códigos comuns: 23505 (PostgreSQL unique violation)
-                    is_duplicate = (error_code == '23505' or 
-                                  'unique' in error_str or 
-                                  'duplicate' in error_str or
-                                  '23505' in str(error_code))
-                    
-                    if is_duplicate:
-                        print(f"Aviso: Tentativa de inserir chunks duplicados (batch {i//batch_size + 1}). Filtrando duplicatas...")
-                        
-                        # Tentar inserir cada registro individualmente para identificar e pular duplicatas
-                        success_count = 0
-                        for record in batch:
-                            try:
-                                self.supabase.table(settings.TABLE_EMBEDDINGS).insert(record).execute()
-                                success_count += 1
-                            except APIError as e2:
-                                error_str2 = str(e2).lower()
-                                error_code2 = e2.code if hasattr(e2, 'code') else None
-                                is_dup2 = (error_code2 == '23505' or 
-                                          'unique' in error_str2 or 
-                                          'duplicate' in error_str2 or
-                                          '23505' in str(error_code2))
-                                if is_dup2:
-                                    # Duplicata, pular silenciosamente
-                                    continue
-                                else:
-                                    # Outro erro, logar
-                                    print(f"Erro ao inserir registro individual: {e2}")
-                        
-                        if success_count > 0:
-                            print(f"Inseridos {success_count}/{len(batch)} registros do batch (outros eram duplicatas)")
-                        
-                        inserted = True
-                        if i + batch_size < len(records):
-                            time.sleep(delay_between_batches)
-                        break  # Considerar como sucesso (duplicatas foram ignoradas)
                     
                     # Se for timeout (57014) e ainda houver tentativas
                     if error_code == '57014' and attempt < max_retries - 1:
@@ -351,21 +285,6 @@ class VectorStore:
             print(f"Erro ao verificar chunks: {e}")
             return False
     
-    def get_existing_chunk_ids(self, document_id: str) -> set:
-        """Retorna um set com os chunk_ids que já existem para um document_id"""
-        try:
-            result = self.supabase.table(settings.TABLE_EMBEDDINGS)\
-                .select("chunk_id")\
-                .eq("document_id", document_id)\
-                .execute()
-            
-            if result.data:
-                return {chunk["chunk_id"] for chunk in result.data}
-            return set()
-        except Exception as e:
-            print(f"Erro ao buscar chunk_ids existentes: {e}")
-            return set()
-    
     def get_document_id_by_filename(self, filename: str) -> str:
         """Retorna o document_id associado a um filename (se existir)"""
         try:
@@ -382,35 +301,8 @@ class VectorStore:
             print(f"Erro ao buscar document_id: {e}")
             return None
     
-    def count_unique_documents(self) -> int:
-        """Conta quantos documentos únicos existem na tabela"""
-        try:
-            result = self.supabase.table(settings.TABLE_EMBEDDINGS)\
-                .select("document_id", count="exact")\
-                .execute()
-            return result.count if hasattr(result, 'count') else len(set(r.get('document_id') for r in result.data))
-        except Exception as e:
-            print(f"Erro ao contar documentos: {e}")
-            return 0
-    
-    def get_oldest_document(self) -> str:
-        """Retorna o document_id do documento mais antigo (primeiro inserido)"""
-        try:
-            result = self.supabase.table(settings.TABLE_EMBEDDINGS)\
-                .select("document_id, created_at")\
-                .order("created_at", desc=False)\
-                .limit(1)\
-                .execute()
-            
-            if result.data and len(result.data) > 0:
-                return result.data[0]["document_id"]
-            return None
-        except Exception as e:
-            print(f"Erro ao buscar documento mais antigo: {e}")
-            return None
-    
-    def delete_document_chunks(self, document_id: str) -> int:
-        """Remove todos os chunks de um documento específico"""
+    def delete_chunks_by_document_id(self, document_id: str) -> int:
+        """Deleta todos os chunks de um documento específico"""
         try:
             result = self.supabase.table(settings.TABLE_EMBEDDINGS)\
                 .delete()\
@@ -418,74 +310,23 @@ class VectorStore:
                 .execute()
             
             deleted_count = len(result.data) if result.data else 0
-            print(f"Removidos {deleted_count} chunks do documento {document_id}")
+            print(f"✅ Deletados {deleted_count} chunks do documento {document_id}")
             return deleted_count
         except Exception as e:
-            print(f"Erro ao remover chunks do documento {document_id}: {e}")
+            print(f"⚠️ Erro ao deletar chunks do documento {document_id}: {e}")
             return 0
     
-    def enforce_document_limit(self, new_document_id: str):
-        """Remove 3 documentos mais antigos para cada novo documento adicionado"""
+    def delete_chunks_by_filename(self, filename: str) -> int:
+        """Deleta todos os chunks de um arquivo específico"""
         try:
-            # Cache para evitar processar o mesmo documento múltiplas vezes
-            if not hasattr(self, '_processed_docs'):
-                self._processed_docs = set()
+            result = self.supabase.table(settings.TABLE_EMBEDDINGS)\
+                .delete()\
+                .eq("filename", filename)\
+                .execute()
             
-            # Se já processamos este documento nesta execução, pular
-            if new_document_id in self._processed_docs:
-                return
-            
-            # Verificar se o novo documento já existe no banco (com chunks significativos)
-            try:
-                result = self.supabase.table(settings.TABLE_EMBEDDINGS)\
-                    .select("id", count="exact")\
-                    .eq("document_id", new_document_id)\
-                    .execute()
-                
-                chunk_count = result.count if hasattr(result, 'count') else len(result.data)
-                
-                # Se já tem chunks significativos (mais de 10), considerar que já existe
-                if chunk_count > 10:
-                    print(f"Documento {new_document_id} já existe ({chunk_count} chunks), não será necessário remover documentos antigos")
-                    self._processed_docs.add(new_document_id)
-                    return
-            except Exception as e:
-                # Se houver erro, continuar normalmente
-                pass
-            
-            # Remover 3 documentos mais antigos para cada novo documento
-            documents_to_remove = 3
-            removed = 0
-            
-            print(f"Preparando para remover {documents_to_remove} documento(s) antigo(s) antes de adicionar o novo...")
-            
-            for i in range(documents_to_remove):
-                oldest_doc_id = self.get_oldest_document()
-                
-                # Não remover o documento que está sendo inserido agora
-                if oldest_doc_id and oldest_doc_id != new_document_id:
-                    deleted_count = self.delete_document_chunks(oldest_doc_id)
-                    if deleted_count > 0:
-                        removed += 1
-                        print(f"Documento antigo {i+1}/{documents_to_remove} removido: {oldest_doc_id}")
-                        # Pequeno delay para não sobrecarregar o banco
-                        time.sleep(0.3)
-                    else:
-                        # Se não conseguiu deletar, continuar tentando os próximos
-                        print(f"Aviso: Não foi possível remover o documento {oldest_doc_id}")
-                else:
-                    # Se não há mais documentos antigos para remover
-                    if not oldest_doc_id:
-                        print(f"Não há mais documentos antigos para remover (total removido: {removed})")
-                    break
-            
-            if removed > 0:
-                print(f"✅ Removidos {removed} documento(s) antigo(s) antes de adicionar o novo documento")
-            else:
-                print(f"ℹ️ Nenhum documento antigo foi removido (tabela pode estar vazia ou só contém o documento atual)")
-            
-            # Marcar este documento como processado
-            self._processed_docs.add(new_document_id)
-                    
+            deleted_count = len(result.data) if result.data else 0
+            print(f"✅ Deletados {deleted_count} chunks do arquivo {filename}")
+            return deleted_count
         except Exception as e:
-            print(f"Erro ao aplicar limite de documentos: {e}")
+            print(f"⚠️ Erro ao deletar chunks do arquivo {filename}: {e}")
+            return 0
